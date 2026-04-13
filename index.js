@@ -12,45 +12,74 @@ import { format } from "date-fns-tz";
 /* ============================= APP ============================= */
 const app = express();
 
-/* ============================= SUPABASE CLIENT (SINGLE - PERFECT) ============================= */
+/* ============================= ENV CHECK ============================= */
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment variables");
+}
+
+/* ============================= SUPABASE CLIENT ============================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   {
     auth: {
       persistSession: false,
-      autoRefreshToken: false
-    }
+      autoRefreshToken: false,
+    },
   }
 );
 
-/* ============================= CORS (FIXED) ============================= */
-app.use(cors({
-  origin: true,
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+/* ============================= CORS ============================= */
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 app.use(express.json());
 
-/* ============================= IN-MEMORY ROOMS + SUPABASE ============================= */
+/* ============================= IN-MEMORY ROOMS ============================= */
 let tournamentRooms = {};
 
-/* ============================= 🔥 MY BALANCE ENDPOINT (5001 COMPATIBLE) ============================= */
+/* ============================= HEALTH CHECK ============================= */
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    time: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
+    supabase: "✅ Connected",
+    roomCacheCount: Object.keys(tournamentRooms).length,
+    myBalance: "✅ ACTIVE",
+    rollback: "✅ ACTIVE",
+    clearApproved: "✅ ACTIVE",
+    adminJoins: "✅ RETURNS ROOM DATA",
+    roomSave: "✅ SUPABASE + CACHE",
+  });
+});
+
+/* ============================= MY BALANCE ============================= */
 app.get("/api/my-balance", async (req, res) => {
   try {
     const { profileId } = req.query;
+
     if (!profileId) {
       console.log("❌ No profileId provided");
       return res.json({ balance: 0 });
     }
-    
-    const { data } = await supabase
+
+    const { data, error } = await supabase
       .from("registeruser")
       .select("balance")
       .eq("profile_id", profileId)
       .single();
-    
+
+    if (error) {
+      console.error("❌ BALANCE FETCH ERROR:", error);
+      return res.json({ balance: 0 });
+    }
+
     const balance = data?.balance || 0;
     console.log("💰 BALANCE FETCH:", profileId, "→ ₹", balance);
     res.json({ balance });
@@ -60,25 +89,35 @@ app.get("/api/my-balance", async (req, res) => {
   }
 });
 
-/* ============================= 🔥 NEW ENDPOINT - CLEAR APPROVED DEPOSITS (WALLET SAFE!) ============================= */
+/* ============================= CLEAR APPROVED DEPOSITS ============================= */
 app.delete("/api/admin/clear-approved/:profileId", async (req, res) => {
   try {
     const { profileId } = req.params;
-    
-    // 🔥 SIRF APPROVED deposits delete karenge (WALLET BALANCE SAFE!)
-    const { data: deletedDeposits, count } = await supabase
+
+    const { data: deletedDeposits, error } = await supabase
       .from("DepositUser")
       .delete()
       .eq("profile_id", profileId)
       .eq("status", "approved")
       .select("amount, date_ist");
 
-    console.log(`🗑️ APPROVED HISTORY CLEARED:`, profileId, `${count || 0} deposits deleted (WALLET SAFE ✅)`);
-    
-    res.json({ 
-      success: true, 
-      cleared: count || 0,
-      message: "Approved deposits cleared! Wallet balance unchanged ✅"
+    if (error) {
+      console.error("❌ CLEAR APPROVED ERROR:", error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    const cleared = deletedDeposits?.length || 0;
+
+    console.log(
+      "🗑️ APPROVED HISTORY CLEARED:",
+      profileId,
+      `${cleared} deposits deleted (WALLET SAFE ✅)`
+    );
+
+    res.json({
+      success: true,
+      cleared,
+      message: "Approved deposits cleared! Wallet balance unchanged ✅",
     });
   } catch (err) {
     console.error("❌ CLEAR APPROVED ERROR:", err);
@@ -86,45 +125,36 @@ app.delete("/api/admin/clear-approved/:profileId", async (req, res) => {
   }
 });
 
-/* ============================= HEALTH CHECK ============================= */
-app.get("/health", (req, res) => {
-  res.json({
-    status: "OK",
-    time: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
-    supabase: "✅ Connected",
-    rooms: Object.keys(tournamentRooms).length,
-    profileFields: "✅ AUTO FROM DEPOSITUSER",
-    roomSave: "✅ SUPABASE PERMANENT",
-    balanceSync: "✅ ACTIVE",
-    myBalance: "✅ ACTIVE",
-    clearApproved: "✅ WALLET SAFE ENDPOINT ACTIVE 🔥",
-    rollback: "✅ TOURNAMENT ROLLBACK ACTIVE 🚀"
-  });
-});
-
-/* ============================= 🔥 ROLLBACK ENDPOINT (NEW - SAFETY FOR WALLET FAILURES!) ============================= */
+/* ============================= ROLLBACK JOIN ============================= */
 app.post("/api/rollback-join/:tournamentId", async (req, res) => {
   try {
     const { tournamentId } = req.params;
     const { bgmiId } = req.query;
-    
+
     if (!bgmiId) {
       return res.status(400).json({ success: false, message: "bgmiId required" });
     }
 
-    // Delete the failed join record (recent most)
-    const { count } = await supabase
+    const { data: deletedRows, error } = await supabase
       .from("tournament_joins")
       .delete()
       .eq("tournament_id", tournamentId)
-      .eq("bgmi_id", bgmiId);
+      .eq("bgmi_id", bgmiId)
+      .select("id");
 
-    console.log("🔄 ROLLBACK SUCCESS:", tournamentId, bgmiId, `${count || 0} records deleted`);
-    
-    res.json({ 
-      success: true, 
-      deleted: count || 0,
-      message: "✅ Tournament join rolled back successfully!"
+    if (error) {
+      console.error("❌ ROLLBACK ERROR:", error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    const deleted = deletedRows?.length || 0;
+
+    console.log("🔄 ROLLBACK SUCCESS:", tournamentId, bgmiId, `${deleted} records deleted`);
+
+    res.json({
+      success: true,
+      deleted,
+      message: "✅ Tournament join rolled back successfully!",
     });
   } catch (err) {
     console.error("❌ ROLLBACK ERROR:", err);
@@ -132,57 +162,71 @@ app.post("/api/rollback-join/:tournamentId", async (req, res) => {
   }
 });
 
-/* ============================= TOURNAMENT ENDPOINTS ============================= */
+/* ============================= JOIN TOURNAMENT ============================= */
 app.post("/api/join-tournament", async (req, res) => {
   const data = req.body;
-  
+
   console.log("📦 RAW DATA RECEIVED:", data);
-  
+
   if (!data.bgmiId || !data.tournamentId || !data.playerName) {
-    return res.status(400).json({ 
-      success: false, 
-      message: "Missing bgmiId, tournamentId or playerName" 
+    return res.status(400).json({
+      success: false,
+      message: "Missing bgmiId, tournamentId or playerName",
     });
   }
 
   try {
-    const { data: existingJoin } = await supabase
+    const { data: existingJoin, error: existingError } = await supabase
       .from("tournament_joins")
       .select("id")
       .eq("tournament_id", data.tournamentId)
       .eq("bgmi_id", data.bgmiId)
       .maybeSingle();
 
+    if (existingError) {
+      console.error("❌ EXISTING JOIN CHECK ERROR:", existingError);
+      return res.status(500).json({ success: false, message: existingError.message });
+    }
+
     if (existingJoin) {
-      return res.json({ 
-        success: false, 
-        message: "❌ Already joined this tournament!" 
+      return res.json({
+        success: false,
+        message: "❌ Already joined this tournament!",
       });
     }
 
-    const { count } = await supabase
+    const { count, error: countError } = await supabase
       .from("tournament_joins")
-      .select("*", { count: 'exact', head: true })
+      .select("*", { count: "exact", head: true })
       .eq("tournament_id", data.tournamentId);
 
-    if (count >= 2) {
-      return res.json({ 
-        success: false, 
-        message: "🔴 Tournament Full (2/2 slots)" 
+    if (countError) {
+      console.error("❌ SLOT COUNT ERROR:", countError);
+      return res.status(500).json({ success: false, message: countError.message });
+    }
+
+    if ((count || 0) >= 50) {
+      return res.json({
+        success: false,
+        message: "🔴 Tournament Full (50/50 slots)",
       });
     }
 
     let profileName = data.profileName || "";
     let profileId = data.profileId || "";
-    
+
     if (!profileId) {
-      const { data: deposits } = await supabase
+      const { data: deposits, error: depositLookupError } = await supabase
         .from("DepositUser")
         .select("profile_id, name")
+        .eq("status", "approved")
         .order("date", { ascending: false })
-        .limit(1)
-        .eq("status", "approved");
-      
+        .limit(1);
+
+      if (depositLookupError) {
+        console.error("❌ PROFILE AUTO-FIND ERROR:", depositLookupError);
+      }
+
       if (deposits?.[0]) {
         profileId = deposits[0].profile_id;
         profileName = deposits[0].name;
@@ -196,15 +240,15 @@ app.post("/api/join-tournament", async (req, res) => {
 
     const cleanData = {
       tournament_id: data.tournamentId,
-      tournament_name: data.tournamentName,
+      tournament_name: data.tournamentName || "",
       player_name: data.playerName,
       bgmi_id: data.bgmiId,
       profile_name: profileName,
       profile_id: profileId,
       mode: data.mode || "TDM",
       rules: data.rulesShort || data.rules || "",
-      date: data.date,
-      time: data.time,
+      date: data.date || "",
+      time: data.time || "",
       map: data.map || "Erangel",
       entry_fee: Number(data.entryFee) || 0,
       prize_pool: Number(data.prizePool) || 0,
@@ -212,7 +256,7 @@ app.post("/api/join-tournament", async (req, res) => {
       status: "Registered",
       joined_at: new Date().toISOString(),
       room_id: "",
-      room_password: ""
+      room_password: "",
     };
 
     console.log("✅ FINAL DATA FOR SUPABASE:", cleanData);
@@ -225,37 +269,42 @@ app.post("/api/join-tournament", async (req, res) => {
 
     if (error) {
       console.error("❌ SUPABASE INSERT ERROR:", error);
-      return res.status(500).json({ 
-        success: false, 
-        message: error.message || "Database error" 
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Database error",
       });
     }
 
     console.log("🎉 NEW JOIN SAVED:", newJoin.id);
-    
-    res.json({ 
-      success: true, 
-      joinId: newJoin.id,
-      message: "✅ Successfully joined tournament!"
-    });
 
+    res.json({
+      success: true,
+      joinId: newJoin.id,
+      message: "✅ Successfully joined tournament!",
+    });
   } catch (err) {
     console.error("❌ SERVER ERROR:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
+/* ============================= CHECK JOIN ============================= */
 app.get("/api/check-join/:tournamentId", async (req, res) => {
   try {
     const bgmiId = req.query.bgmiId;
     if (!bgmiId) return res.json({ joined: false });
 
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("tournament_joins")
       .select("id")
       .eq("tournament_id", req.params.tournamentId)
       .eq("bgmi_id", bgmiId)
       .maybeSingle();
+
+    if (error) {
+      console.error("CHECK JOIN ERROR:", error);
+      return res.json({ joined: false });
+    }
 
     res.json({ joined: !!data });
   } catch (err) {
@@ -264,23 +313,30 @@ app.get("/api/check-join/:tournamentId", async (req, res) => {
   }
 });
 
+/* ============================= SLOT COUNT ============================= */
 app.get("/api/tournament-slots-count/:tournamentId", async (req, res) => {
   try {
-    const { count } = await supabase
+    const { count, error } = await supabase
       .from("tournament_joins")
-      .select("*", { count: 'exact', head: true })
+      .select("*", { count: "exact", head: true })
       .eq("tournament_id", req.params.tournamentId);
 
-    res.json({ 
-      registered: count || 0, 
-      max: 2 
+    if (error) {
+      console.error("SLOTS ERROR:", error);
+      return res.json({ registered: 0, max: 50 });
+    }
+
+    res.json({
+      registered: count || 0,
+      max: 50,
     });
   } catch (err) {
     console.error("SLOTS ERROR:", err);
-    res.json({ registered: 0, max: 2 });
+    res.json({ registered: 0, max: 50 });
   }
 });
 
+/* ============================= MY MATCHES ============================= */
 app.get("/api/my-matches", async (req, res) => {
   try {
     const bgmiId = req.query.bgmiId;
@@ -297,10 +353,13 @@ app.get("/api/my-matches", async (req, res) => {
       return res.json({ matches: [] });
     }
 
-    const matchesWithRooms = (matches || []).map(match => ({
+    const matchesWithRooms = (matches || []).map((match) => ({
       ...match,
       roomId: match.room_id || tournamentRooms[match.tournament_id]?.roomId || "",
-      roomPassword: match.room_password || tournamentRooms[match.tournament_id]?.roomPassword || ""
+      roomPassword:
+        match.room_password ||
+        tournamentRooms[match.tournament_id]?.roomPassword ||
+        "",
     }));
 
     res.json({ matches: matchesWithRooms });
@@ -310,89 +369,109 @@ app.get("/api/my-matches", async (req, res) => {
   }
 });
 
+/* ============================= ADMIN JOINS (FIXED) ============================= */
 app.get("/api/admin/joins", async (req, res) => {
   try {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("tournament_joins")
       .select("*")
       .order("joined_at", { ascending: false });
 
-    const cleanJoins = (data || []).map(j => {
-      const { room_id, room_password, ...rest } = j;
-      return rest;
-    });
+    if (error) {
+      console.error("ADMIN JOINS ERROR:", error);
+      return res.json({ tournamentJoins: [] });
+    }
 
-    console.log("✅ Admin joins sent (NO rooms):", cleanJoins.length);
-    res.json({ tournamentJoins: cleanJoins });
+    const synced = (data || []).map((j) => ({
+      ...j,
+      room_id: j.room_id || tournamentRooms[j.tournament_id]?.roomId || "",
+      room_password:
+        j.room_password || tournamentRooms[j.tournament_id]?.roomPassword || "",
+    }));
+
+    console.log("✅ Admin joins sent:", synced.length);
+    res.json({ tournamentJoins: synced });
   } catch (err) {
     console.error("ADMIN JOINS ERROR:", err);
     res.json({ tournamentJoins: [] });
   }
 });
 
+/* ============================= SAVE ROOM ============================= */
 app.put("/api/admin/set-room-by-tournament", async (req, res) => {
   const { tournamentId, roomId, roomPassword } = req.body;
-  
+
   if (!tournamentId) {
     return res.status(400).json({ success: false, message: "tournamentId required" });
   }
-  
+
   try {
     tournamentRooms[tournamentId] = {
       roomId: roomId || "",
-      roomPassword: roomPassword || ""
+      roomPassword: roomPassword || "",
     };
-    
-    const { error } = await supabase
+
+    const { data: updatedRows, error } = await supabase
       .from("tournament_joins")
-      .update({ 
+      .update({
         room_id: roomId || "",
-        room_password: roomPassword || ""
+        room_password: roomPassword || "",
       })
-      .eq("tournament_id", tournamentId);
+      .eq("tournament_id", tournamentId)
+      .select("id");
 
     if (error) {
       console.error("❌ SUPABASE ROOM SAVE ERROR:", error);
+      return res.status(500).json({ success: false, message: error.message });
     }
-    
-    console.log("✅ ROOM SAVED:", { 
-      tournamentId, 
-      roomId: roomId || "empty", 
-      roomPassword: roomPassword || "empty" 
+
+    const updatedCount = updatedRows?.length || 0;
+
+    console.log("✅ ROOM SAVED:", {
+      tournamentId,
+      updatedCount,
+      roomId: roomId || "empty",
+      roomPassword: roomPassword || "empty",
     });
-    
-    res.json({ 
-      success: true, 
-      message: "✅ Room saved PERMANENTLY!" 
+
+    res.json({
+      success: true,
+      updated: updatedCount,
+      message: "✅ Room saved permanently!",
     });
-    
   } catch (err) {
     console.error("❌ ROOM SAVE ERROR:", err);
     res.status(500).json({ success: false, message: "Save failed" });
   }
 });
 
+/* ============================= DELETE JOIN ============================= */
 app.delete("/api/admin/tournament/:id", async (req, res) => {
   try {
-    const { error } = await supabase
+    const { data: deletedRows, error } = await supabase
       .from("tournament_joins")
       .delete()
-      .eq("id", req.params.id);
+      .eq("id", req.params.id)
+      .select("id, tournament_id");
 
     if (error) {
       console.error("DELETE ERROR:", error);
       return res.status(500).json({ success: false, message: error.message });
     }
-    
+
     console.log("✅ DELETED:", req.params.id);
-    res.json({ success: true });
+
+    res.json({
+      success: true,
+      deleted: deletedRows?.length || 0,
+    });
   } catch (err) {
     console.error("DELETE ERROR:", err);
     res.status(500).json({ success: false });
   }
 });
 
-/* ============================= 🔥 FIXED DEPOSIT ENDPOINTS (BALANCE SYNC PERFECT!) ============================= */
+/* ============================= DEPOSIT CREATE ============================= */
 app.post("/api/deposit", async (req, res) => {
   const { profileId, username, email, amount, utr } = req.body;
 
@@ -402,20 +481,24 @@ app.post("/api/deposit", async (req, res) => {
 
   try {
     const nowUTC = new Date().toISOString();
-    const nowIST = format(new Date(), "dd/MM/yyyy, hh:mm:ss a", { timeZone: "Asia/Kolkata" });
+    const nowIST = format(new Date(), "dd/MM/yyyy, hh:mm:ss a", {
+      timeZone: "Asia/Kolkata",
+    });
 
     const { data, error } = await supabase
       .from("DepositUser")
-      .insert([{
-        profile_id: profileId.toString(),
-        name: username || "Unknown",
-        email: email || "no-email",
-        amount: Number(amount),
-        utr: utr.toString(),
-        status: 'pending',
-        date: nowUTC,
-        date_ist: nowIST
-      }])
+      .insert([
+        {
+          profile_id: profileId.toString(),
+          name: username || "Unknown",
+          email: email || "no-email",
+          amount: Number(amount),
+          utr: utr.toString(),
+          status: "pending",
+          date: nowUTC,
+          date_ist: nowIST,
+        },
+      ])
       .select()
       .single();
 
@@ -427,21 +510,20 @@ app.post("/api/deposit", async (req, res) => {
     console.log("✅ NEW DEPOSIT:", profileId, "₹", amount, "→ PENDING");
     res.json({ success: true, deposit: data });
   } catch (err) {
-    console.error(err);
+    console.error("❌ DEPOSIT ERROR:", err);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
 
-/* 🔥 APPROVE = WALLET + REGISTERUSER BALANCE UPDATE (FIXED!) */
+/* ============================= APPROVE DEPOSIT ============================= */
 app.put("/api/admin/deposit-status/:id", async (req, res) => {
   const { status } = req.body;
-  
+
   if (!status) {
     return res.status(400).json({ success: false, message: "Status required" });
   }
 
   try {
-    // 1. Deposit details fetch kar
     const { data: deposit, error: depositError } = await supabase
       .from("DepositUser")
       .select("*")
@@ -449,27 +531,38 @@ app.put("/api/admin/deposit-status/:id", async (req, res) => {
       .single();
 
     if (depositError || !deposit) {
-      console.error("❌ Deposit not found:", req.params.id);
+      console.error("❌ Deposit not found:", req.params.id, depositError);
       return res.status(500).json({ success: false, message: "Deposit not found" });
     }
 
-    console.log("🔍 DEPOSIT FOUND:", deposit.profile_id, "₹", deposit.amount, deposit.status, "→", status);
+    console.log(
+      "🔍 DEPOSIT FOUND:",
+      deposit.profile_id,
+      "₹",
+      deposit.amount,
+      deposit.status,
+      "→",
+      status
+    );
 
-    // 🔥 2. APPROVE HUA TO REGISTERUSER BALANCE ADD KAR (ONLY PENDING!)
     if (status === "approved" && deposit.status === "pending") {
-      // Current balance check kar
-      const { data: user } = await supabase
+      const { data: user, error: userError } = await supabase
         .from("registeruser")
         .select("balance")
         .eq("profile_id", deposit.profile_id)
         .single();
 
-      const currentBalance = user?.balance || 0;
-      const newBalance = currentBalance + deposit.amount;
+      if (userError) {
+        console.error("❌ USER FETCH ERROR:", userError);
+        return res.status(500).json({ success: false, message: "User fetch failed" });
+      }
 
-      console.log("💰 BEFORE:", currentBalance, "→ ADDING ₹", deposit.amount);
+      const currentBalance = Number(user?.balance || 0);
+      const depositAmount = Number(deposit.amount || 0);
+      const newBalance = currentBalance + depositAmount;
 
-      // Balance update kar
+      console.log("💰 BEFORE:", currentBalance, "→ ADDING ₹", depositAmount);
+
       const { error: balanceError } = await supabase
         .from("registeruser")
         .update({ balance: newBalance })
@@ -480,12 +573,18 @@ app.put("/api/admin/deposit-status/:id", async (req, res) => {
         return res.status(500).json({ success: false, message: "Balance update failed" });
       }
 
-      console.log("✅ BALANCE SYNC SUCCESS:", deposit.profile_id, "₹", currentBalance, "→", newBalance);
+      console.log(
+        "✅ BALANCE SYNC SUCCESS:",
+        deposit.profile_id,
+        "₹",
+        currentBalance,
+        "→",
+        newBalance
+      );
     } else {
-      console.log("ℹ️ SKIP BALANCE UPDATE:", deposit.status, "→", status, "(not pending→approved)");
+      console.log("ℹ️ SKIP BALANCE UPDATE:", deposit.status, "→", status);
     }
 
-    // 3. Deposit status update kar
     const { data: updatedDeposit, error: statusError } = await supabase
       .from("DepositUser")
       .update({ status })
@@ -500,14 +599,13 @@ app.put("/api/admin/deposit-status/:id", async (req, res) => {
 
     console.log("✅ DEPOSIT STATUS:", deposit.profile_id, "→", status);
     res.json({ success: true, deposit: updatedDeposit });
-
   } catch (err) {
     console.error("❌ APPROVE ERROR:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-/* 🔥 DELETE = SIRF HISTORY CLEAR (BALANCE SAFE) */
+/* ============================= DELETE DEPOSIT ============================= */
 app.delete("/api/admin/deposit/:id", async (req, res) => {
   try {
     const { data: deposit } = await supabase
@@ -526,43 +624,71 @@ app.delete("/api/admin/deposit/:id", async (req, res) => {
       return res.status(500).json({ success: false, message: error.message });
     }
 
-    console.log("🗑️ DEPOSIT DELETED:", deposit?.profile_id, "₹", deposit?.amount, "(BALANCE SAFE)");
+    console.log(
+      "🗑️ DEPOSIT DELETED:",
+      deposit?.profile_id,
+      "₹",
+      deposit?.amount,
+      "(BALANCE SAFE)"
+    );
+
     res.json({ success: true });
   } catch (err) {
-    console.error(err);
+    console.error("❌ DELETE DEPOSIT ERROR:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
+/* ============================= GET DEPOSITS ============================= */
 app.get("/api/deposits", async (req, res) => {
-  const { data, error } = await supabase
-    .from("DepositUser")
-    .select("*")
-    .order("date", { ascending: false });
+  try {
+    const { data, error } = await supabase
+      .from("DepositUser")
+      .select("*")
+      .order("date", { ascending: false });
 
-  if (error) return res.json({ deposits: [] });
-  res.json({ deposits: data });
+    if (error) {
+      console.error("GET DEPOSITS ERROR:", error);
+      return res.json({ deposits: [] });
+    }
+
+    res.json({ deposits: data || [] });
+  } catch (err) {
+    console.error("GET DEPOSITS ERROR:", err);
+    res.json({ deposits: [] });
+  }
 });
 
 app.get("/api/admin/deposits", async (req, res) => {
-  const { data } = await supabase
-    .from("DepositUser")
-    .select("*")
-    .order("date", { ascending: false });
+  try {
+    const { data, error } = await supabase
+      .from("DepositUser")
+      .select("*")
+      .order("date", { ascending: false });
 
-  res.json({ deposits: data || [] });
+    if (error) {
+      console.error("ADMIN DEPOSITS ERROR:", error);
+      return res.json({ deposits: [] });
+    }
+
+    res.json({ deposits: data || [] });
+  } catch (err) {
+    console.error("ADMIN DEPOSITS ERROR:", err);
+    res.json({ deposits: [] });
+  }
 });
 
 /* ============================= SERVER START ============================= */
 const PORT = process.env.PORT || 5002;
+
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("🔥 BGMI Server (5002) running on port", PORT);
-  console.log("✅ Health: http://localhost:5002/health");
-  console.log("✅ Tournament Joins → SUPABASE (AUTO-PROFILE)");
-  console.log("✅ ROOMS → SUPABASE PERMANENT SAVE! 🔥");
-  console.log("✅ BALANCE SYNC → REGISTERUSER + WALLET! 💰");
-  console.log("✅ MY-BALANCE ENDPOINT → ACTIVE!");
-  console.log("✅ ROLLBACK ENDPOINT → ACTIVE! 🚀");
-  console.log("✅ CLEAR APPROVED → WALLET SAFE! 🧹");
-  console.log("✅ Admin inputs → KHALI | MyMatches → Rooms dikhenge!");
+  console.log("🔥 BGMI Server running on port", PORT);
+  console.log(`✅ Health: http://localhost:${PORT}/health`);
+  console.log("✅ Tournament Joins → SUPABASE");
+  console.log("✅ Admin joins → ROOM DATA INCLUDED");
+  console.log("✅ Rooms → SUPABASE PERMANENT SAVE");
+  console.log("✅ Balance sync → REGISTERUSER + WALLET");
+  console.log("✅ Rollback endpoint → ACTIVE");
+  console.log("✅ Clear approved endpoint → ACTIVE");
+  console.log("✅ Tournament slots → 50 players allowed");
 });
