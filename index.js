@@ -1,7 +1,4 @@
 
-/* ============================= LOAD ENV ============================= */
-import dotenv from "dotenv";
-dotenv.config();
 
 /* ============================= IMPORTS ============================= */
 import express from "express";
@@ -9,6 +6,21 @@ import cors from "cors";
 import { nanoid } from "nanoid";
 import { createClient } from "@supabase/supabase-js";
 import { format } from "date-fns-tz";
+import { createRequireUser, createRequireAdmin } from "./authMiddleware.js"; // ✅ CHANGED
+import dotenv from "dotenv";
+dotenv.config();
+
+import crypto from "crypto";
+
+console.log("DEPOSIT JWT CHECK:", {
+  length: process.env.JWT_SECRET?.length,
+  fingerprint: crypto
+    .createHash("sha256")
+    .update(process.env.JWT_SECRET || "")
+    .digest("hex")
+    .slice(0, 10),
+});
+
 
 /* ============================= APP ============================= */
 const app = express();
@@ -29,6 +41,10 @@ const supabase = createClient(
     },
   }
 );
+
+/* ============================= AUTH MIDDLEWARE ============================= */
+const requireUser = createRequireUser(supabase); // ✅ CHANGED
+const requireAdmin = createRequireAdmin(supabase); // ✅ CHANGED
 
 /* ============================= MIDDLEWARE ============================= */
 app.use(cors({
@@ -485,7 +501,8 @@ app.get("/api/my-balance", async (req, res) => {
 });
 
 /* ============================= CLEAR APPROVED DEPOSITS ============================= */
-app.delete("/api/admin/clear-approved/:profileId", async (req, res) => {
+// ✅ CHANGED: requireAdmin added
+app.delete("/api/admin/clear-approved/:profileId", requireAdmin, async (req, res) => {
   try {
     const profileId = cleanString(req.params.profileId);
 
@@ -1282,8 +1299,10 @@ app.delete("/api/admin/tournament/:id", async (req, res) => {
 });
 
 /* ============================= CREATE DEPOSIT ============================= */
-app.post("/api/deposit", async (req, res) => {
-  const profileId = cleanString(req.body?.profileId);
+// ✅ CHANGED: requireUser added, profileId now comes from the login token
+app.post("/api/deposit", requireUser, async (req, res) => {
+  // body ke profileId par bharosa nahi: token wali profile_id hi use hogi
+  const profileId = cleanString(req.player.profile_id);
   const amount = Number(req.body?.amount);
   const utr = cleanString(req.body?.utr);
 
@@ -1291,13 +1310,6 @@ app.post("/api/deposit", async (req, res) => {
     return res.status(400).json({
       success: false,
       message: "Missing required fields",
-    });
-  }
-
-  if (profileId.length < 3 || profileId.length > 100) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid profileId",
     });
   }
 
@@ -1390,10 +1402,20 @@ app.post("/api/deposit", async (req, res) => {
     if (error) {
       console.error("DEPOSIT INSERT ERROR:", error);
 
+      // Database constraint se duplicate UTR pakda gaya
       if (error.code === "23505") {
+        const text = `${error.message || ""} ${error.details || ""}`;
+
+        if (text.includes("deposit_id")) {
+          return res.status(500).json({
+            success: false,
+            message: "Could not create deposit. Please try again.",
+          });
+        }
+
         return res.status(409).json({
           success: false,
-          message: "This deposit or UTR already exists",
+          message: "This UTR has already been submitted",
         });
       }
 
@@ -1425,90 +1447,106 @@ app.post("/api/deposit", async (req, res) => {
 });
 
 /* ============================= APPROVE / REJECT DEPOSIT ============================= */
-app.put("/api/admin/deposit-status/:id", async (req, res) => {
+// ✅ CHANGED: requireAdmin + atomic Supabase RPC (approve_deposit / reject_deposit)
+app.put("/api/admin/deposit-status/:id", requireAdmin, async (req, res) => {
   const status = cleanString(req.body?.status).toLowerCase();
+  const depositId = Number(req.params.id);
+  const adminId = cleanString(req.admin?.admin_id);
 
-  if (!["pending", "approved", "rejected"].includes(status)) {
+  // Ab sirf pending ko approve ya reject kiya ja sakta hai
+  if (!["approved", "rejected"].includes(status)) {
     return res.status(400).json({
       success: false,
-      message: "Invalid deposit status",
+      message: "Status must be approved or rejected",
+    });
+  }
+
+  if (!Number.isSafeInteger(depositId) || depositId <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid deposit id",
+    });
+  }
+
+  if (!adminId) {
+    return res.status(401).json({
+      success: false,
+      message: "Admin identity missing. Please login again.",
     });
   }
 
   try {
-    const { data: deposit, error: depositError } = await supabase
-      .from("DepositUser")
-      .select("*")
-      .eq("id", req.params.id)
-      .single();
+    let rpcError = null;
 
-    if (depositError || !deposit) {
-      return res.status(404).json({
-        success: false,
-        message: "Deposit not found",
+    if (status === "approved") {
+      const { error } = await supabase.rpc("approve_deposit", {
+        p_deposit_id: depositId,
+        p_admin_id: adminId,
       });
+
+      rpcError = error;
+    } else {
+      const reason = cleanString(req.body?.reason).slice(0, 300);
+
+      const { error } = await supabase.rpc("reject_deposit", {
+        p_deposit_id: depositId,
+        p_admin_id: adminId,
+        p_reason: reason || null,
+      });
+
+      rpcError = error;
     }
 
-    if (status === "approved" && deposit.status === "pending") {
-      const { data: user, error: userError } = await supabase
-        .from("registeruser")
-        .select("balance")
-        .eq("profile_id", deposit.profile_id)
-        .single();
+    if (rpcError) {
+      const message = String(rpcError.message || "");
 
-      if (userError || !user) {
+      console.error("DEPOSIT RPC ERROR:", rpcError);
+
+      if (message.includes("DEPOSIT_NOT_FOUND")) {
         return res.status(404).json({
           success: false,
-          message: "User fetch failed",
+          message: "Deposit not found",
         });
       }
 
-      const currentBalance = Number(user.balance || 0);
-      const depositAmount = Number(deposit.amount || 0);
+      if (message.includes("DEPOSIT_NOT_PENDING")) {
+        return res.status(409).json({
+          success: false,
+          message: "This deposit has already been processed",
+        });
+      }
 
-      if (!Number.isFinite(depositAmount) || depositAmount <= 0) {
+      if (message.includes("USER_NOT_FOUND")) {
+        return res.status(404).json({
+          success: false,
+          message: "User account not found",
+        });
+      }
+
+      if (message.includes("INVALID_AMOUNT")) {
         return res.status(400).json({
           success: false,
           message: "Invalid deposit amount",
         });
       }
 
-      const newBalance = currentBalance + depositAmount;
-
-      const { data: updatedUser, error: balanceError } = await supabase
-        .from("registeruser")
-        .update({ balance: newBalance })
-        .eq("profile_id", deposit.profile_id)
-        .eq("balance", currentBalance)
-        .select("profile_id, balance")
-        .maybeSingle();
-
-      if (balanceError) {
-        return res.status(500).json({
-          success: false,
-          message: "Balance update failed",
-        });
-      }
-
-      if (!updatedUser) {
-        return res.status(409).json({
-          success: false,
-          message: "Wallet changed during approval. Please try again.",
-        });
-      }
-    }
-
-    const { data: updatedDeposit, error: statusError } = await supabase
-      .from("DepositUser")
-      .update({ status })
-      .eq("id", req.params.id)
-      .select()
-      .single();
-
-    if (statusError) {
       return res.status(500).json({
         success: false,
-        message: "Deposit status update failed",
+        message: "Deposit could not be processed",
+      });
+    }
+
+    const { data: updatedDeposit, error: fetchError } = await supabase
+      .from("DepositUser")
+      .select("*")
+      .eq("id", depositId)
+      .single();
+
+    if (fetchError || !updatedDeposit) {
+      // RPC ho chuka hai, bas latest row nahi mili
+      return res.json({
+        success: true,
+        deposit: { id: depositId, status },
       });
     }
 
@@ -1526,7 +1564,8 @@ app.put("/api/admin/deposit-status/:id", async (req, res) => {
 });
 
 /* ============================= DELETE DEPOSIT ============================= */
-app.delete("/api/admin/deposit/:id", async (req, res) => {
+// ✅ CHANGED: requireAdmin added
+app.delete("/api/admin/deposit/:id", requireAdmin, async (req, res) => {
   try {
     const { data: deposit } = await supabase
       .from("DepositUser")
@@ -1557,7 +1596,8 @@ app.delete("/api/admin/deposit/:id", async (req, res) => {
 });
 
 /* ============================= USER DEPOSITS ============================= */
-app.get("/api/deposits", async (req, res) => {
+// ✅ CHANGED: requireUser added, user ko sirf apni history milegi
+app.get("/api/deposits", requireUser, async (req, res) => {
   res.set({
     "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
     Pragma: "no-cache",
@@ -1565,9 +1605,10 @@ app.get("/api/deposits", async (req, res) => {
   });
 
   try {
-    const profileId = cleanString(req.query.profileId);
+    // query ke profileId par bharosa nahi: token wali profile_id use hogi
+    const profileId = cleanString(req.player.profile_id);
 
-    if (!profileId || profileId.length < 3 || profileId.length > 100) {
+    if (!profileId) {
       return res.status(400).json({
         success: false,
         message: "Valid profileId required",
@@ -1605,7 +1646,8 @@ app.get("/api/deposits", async (req, res) => {
 });
 
 /* ============================= ADMIN DEPOSITS ============================= */
-app.get("/api/admin/deposits", async (req, res) => {
+// ✅ CHANGED: requireAdmin added
+app.get("/api/admin/deposits", requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("DepositUser")
@@ -1637,7 +1679,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Match key: NORMALIZED HH:MM:SS");
   console.log("Wallet deduction: ACTIVE");
   console.log("Failed join refund: ACTIVE");
-  console.log("Deposit APIs: ACTIVE");
+  console.log("Deposit APIs: ACTIVE (user + admin auth)");
+  console.log("Deposit approval: ATOMIC RPC");
   console.log("My Matches: PROFILE FILTER");
   console.log("Room storage: SUPABASE");
   console.log("======================================");
